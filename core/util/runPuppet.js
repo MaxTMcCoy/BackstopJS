@@ -3,7 +3,6 @@ const puppeteer = require('puppeteer');
 const fs = require('./fs');
 const path = require('path');
 const chalk = require('chalk');
-const _ = require('lodash');
 const ensureDirectoryPath = require('./ensureDirectoryPath');
 const injectBackstopTools = require('../../capture/backstopTools.js');
 const engineTools = require('./engineTools');
@@ -37,6 +36,54 @@ module.exports = function (args) {
   return processScenarioView(scenario, variantOrScenarioLabelSafe, scenarioLabelSafe, viewport, config);
 };
 
+/**
+ *
+ * Launch the browser, or connect to it.
+ *
+ * @param {Object} puppeteerArgs
+ * @returns {Promise<Puppeteer.Browser>}
+ */
+async function obtainBrowser (puppeteerArgs) {
+  if (puppeteerArgs.remote === true) {
+    return puppeteer.connect(puppeteerArgs.remoteOptions);
+  }
+
+  return puppeteer.launch(puppeteerArgs);
+}
+
+/**
+ * Close the browser, or disconnect from it.
+ *
+ * @param {Puppeteer.Browser} browser
+ * @param {Object} puppeteerArgs
+ * @returns {Promise<*>}
+ */
+async function releaseBrowser (browser, puppeteerArgs) {
+  if (puppeteerArgs.remote === true) {
+    return browser.disconnect();
+  }
+
+  return browser.close();
+}
+
+/**
+ * Build the puppeteer args object.
+ *
+ * @param {Object} config
+ * @returns {Object}
+ */
+function buildPuppeteerArgs (config) {
+  return Object.assign(
+    {},
+    {
+      ignoreHTTPSErrors: true,
+      headless: !config.debugWindow,
+      remote: false
+    },
+    config.engineOptions
+  );
+}
+
 async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenarioLabelSafe, viewport, config) {
   if (!config.paths) {
     config.paths = {};
@@ -52,19 +99,13 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
   const VP_W = viewport.width || viewport.viewport.width;
   const VP_H = viewport.height || viewport.viewport.height;
 
-  const puppeteerArgs = Object.assign(
-    {},
-    {
-      ignoreHTTPSErrors: true,
-      headless: !config.debugWindow
-    },
-    config.engineOptions
-  );
+  const puppeteerArgs = buildPuppeteerArgs(config);
 
-  const browser = await puppeteer.launch(puppeteerArgs);
+  const browser = await obtainBrowser(puppeteerArgs);
   const page = await browser.newPage();
 
-  await page.setViewport({ width: VP_W, height: VP_H });
+  // @todo: Await setting the viewport.
+  page.setViewport({ width: VP_W, height: VP_H });
   page.setDefaultNavigationTimeout(engineTools.getEngineOption(config, 'waitTimeout', TEST_TIMEOUT));
 
   if (isReference) {
@@ -73,16 +114,10 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
 
   // --- set up console output and ready event ---
   const readyEvent = scenario.readyEvent || config.readyEvent;
-  const readyTimeout = scenario.readyTimeout || config.readyTimeout || 30000;
-  let readyResolve, readyPromise, readyTimeoutTimer;
+  let readyResolve, readyPromise;
   if (readyEvent) {
     readyPromise = new Promise(resolve => {
       readyResolve = resolve;
-      // fire the ready event after the readyTimeout
-      readyTimeoutTimer = setTimeout(() => {
-        console.error(chalk.red(`ReadyEvent not detected within readyTimeout limit. (${readyTimeout} ms)`), scenario.url);
-        resolve();
-      }, readyTimeout);
     });
   }
 
@@ -96,8 +131,8 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
     }
   });
 
-  const chromeVersion = await page.evaluate(_ => {
-    const v = navigator.userAgent.match(/Chrom(e|ium)\/([0-9]+)\./);
+  let chromeVersion = await page.evaluate(_ => {
+    let v = navigator.userAgent.match(/Chrom(e|ium)\/([0-9]+)\./);
     return v ? parseInt(v[2], 10) : 0;
   });
 
@@ -108,18 +143,18 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
   let result;
   const puppetCommands = async () => {
     // --- BEFORE SCRIPT ---
-    const onBeforeScript = scenario.onBeforeScript || config.onBeforeScript;
+    var onBeforeScript = scenario.onBeforeScript || config.onBeforeScript;
     if (onBeforeScript) {
-      const beforeScriptPath = path.resolve(engineScriptsPath, onBeforeScript);
+      var beforeScriptPath = path.resolve(engineScriptsPath, onBeforeScript);
       if (fs.existsSync(beforeScriptPath)) {
-        await require(beforeScriptPath)(page, scenario, viewport, isReference, browser, config);
+        await require(beforeScriptPath)(page, scenario, viewport, isReference, browser);
       } else {
         console.warn('WARNING: script not found: ' + beforeScriptPath);
       }
     }
 
     //  --- OPEN URL ---
-    let url = scenario.url;
+    var url = scenario.url;
     if (isReference && scenario.referenceUrl) {
       url = scenario.referenceUrl;
     }
@@ -133,33 +168,29 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
 
       await readyPromise;
 
-      clearTimeout(readyTimeoutTimer);
-
       await page.evaluate(_ => console.info('readyEvent ok'));
     }
 
     // --- WAIT FOR SELECTOR ---
     if (scenario.readySelector) {
-      await page.waitForSelector(scenario.readySelector, {
-        timeout: readyTimeout
-      });
+      await page.waitFor(scenario.readySelector);
     }
     //
 
     // --- DELAY ---
     if (scenario.delay > 0) {
-      await page.waitForTimeout(scenario.delay);
+      await page.waitFor(scenario.delay);
     }
 
     // --- REMOVE SELECTORS ---
-    if (_.has(scenario, 'removeSelectors')) {
+    if (scenario.hasOwnProperty('removeSelectors')) {
       const removeSelectors = async () => {
         return Promise.all(
           scenario.removeSelectors.map(async (selector) => {
             await page
               .evaluate((sel) => {
                 document.querySelectorAll(sel).forEach(s => {
-                  s.style.cssText = 'display: none !important;';
+                  s.style.display = 'none';
                   s.classList.add('__86d');
                 });
               }, selector);
@@ -171,11 +202,11 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
     }
 
     //  --- ON READY SCRIPT ---
-    const onReadyScript = scenario.onReadyScript || config.onReadyScript;
+    var onReadyScript = scenario.onReadyScript || config.onReadyScript;
     if (onReadyScript) {
-      const readyScriptPath = path.resolve(engineScriptsPath, onReadyScript);
+      var readyScriptPath = path.resolve(engineScriptsPath, onReadyScript);
       if (fs.existsSync(readyScriptPath)) {
-        await require(readyScriptPath)(page, scenario, viewport, isReference, browser, config);
+        await require(readyScriptPath)(page, scenario, viewport, isReference, browser);
       } else {
         console.warn('WARNING: script not found: ' + readyScriptPath);
       }
@@ -185,7 +216,7 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
     await injectBackstopTools(page);
 
     // --- HIDE SELECTORS ---
-    if (_.has(scenario, 'hideSelectors')) {
+    if (scenario.hasOwnProperty('hideSelectors')) {
       const hideSelectors = async () => {
         return Promise.all(
           scenario.hideSelectors.map(async (selector) => {
@@ -202,7 +233,7 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
     }
 
     // --- HANDLE NO-SELECTORS ---
-    if (!_.has(scenario, 'selectors') || !scenario.selectors.length) {
+    if (!scenario.hasOwnProperty('selectors') || !scenario.selectors.length) {
       scenario.selectors = [DOCUMENT_SELECTOR];
     }
 
@@ -256,7 +287,7 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
       error = e;
     }
   } else {
-    await browser.close();
+    await releaseBrowser(browser, puppeteerArgs);
   }
 
   if (error) {
@@ -265,9 +296,9 @@ async function processScenarioView (scenario, variantOrScenarioLabelSafe, scenar
     testPair.engineErrorMsg = error.message;
 
     compareConfig = {
-      testPairs: [testPair]
+      testPairs: [ testPair ]
     };
-    await fs.copy(config.env.backstop + ERROR_SELECTOR_PATH, filePath);
+    fs.copy(config.env.backstop + ERROR_SELECTOR_PATH, filePath);
   }
 
   return Promise.resolve(compareConfig);
@@ -285,11 +316,11 @@ async function delegateSelectors (
   selectors,
   selectorMap
 ) {
-  const compareConfig = { testPairs: [] };
+  let compareConfig = { testPairs: [] };
   let captureDocument = false;
   let captureViewport = false;
-  const captureList = [];
-  const captureJobs = [];
+  let captureList = [];
+  let captureJobs = [];
 
   selectors.forEach(function (selector, selectorIndex) {
     const testPair = engineTools.generateTestPair(config, scenario, viewport, variantOrScenarioLabelSafe, scenarioLabelSafe, selectorIndex, selector);
@@ -310,20 +341,22 @@ async function delegateSelectors (
   });
 
   if (captureDocument) {
-    captureJobs.push(function () { return captureScreenshot(page, browser, captureDocument, selectorMap, config, [], viewport); });
+    captureJobs.push(function () { return captureScreenshot(page, browser, captureDocument, selectorMap, config, []); });
   }
   // TODO: push captureViewport into captureList (instead of calling captureScreenshot()) to improve perf.
   if (captureViewport) {
-    captureJobs.push(function () { return captureScreenshot(page, browser, captureViewport, selectorMap, config, [], viewport); });
+    captureJobs.push(function () { return captureScreenshot(page, browser, captureViewport, selectorMap, config, []); });
   }
   if (captureList.length) {
-    captureJobs.push(function () { return captureScreenshot(page, browser, null, selectorMap, config, captureList, viewport); });
+    captureJobs.push(function () { return captureScreenshot(page, browser, null, selectorMap, config, captureList); });
   }
 
+  const puppeteerArgs = buildPuppeteerArgs(config);
+
   return new Promise(function (resolve, reject) {
-    let job = null;
-    const errors = [];
-    const next = function () {
+    var job = null;
+    var errors = [];
+    var next = function () {
       if (captureJobs.length === 0) {
         if (errors.length === 0) {
           resolve();
@@ -343,27 +376,27 @@ async function delegateSelectors (
     next();
   }).then(async () => {
     console.log(chalk.green('x Close Browser'));
-    await browser.close();
+    await releaseBrowser(browser, puppeteerArgs);
   }).catch(async (err) => {
     console.log(chalk.red(err));
-    await browser.close();
+    await releaseBrowser(browser, puppeteerArgs);
   }).then(_ => compareConfig);
 }
 
-async function captureScreenshot (page, browser, selector, selectorMap, config, selectors, viewport) {
+async function captureScreenshot (page, browser, selector, selectorMap, config, selectors) {
   let filePath;
-  const fullPage = (selector === NOCLIP_SELECTOR || selector === DOCUMENT_SELECTOR);
+  let fullPage = (selector === NOCLIP_SELECTOR || selector === DOCUMENT_SELECTOR);
   if (selector) {
     filePath = selectorMap[selector].filePath;
     ensureDirectoryPath(filePath);
-
     try {
-      await page.screenshot({
-        path: filePath,
-        fullPage: fullPage
-      });
+      await page
+        .screenshot({
+          path: filePath,
+          fullPage: fullPage
+        });
     } catch (e) {
-      console.log(chalk.red('Error capturing..'), e);
+      console.log(chalk.red(`Error capturing..`), e);
       return fs.copy(config.env.backstop + ERROR_SELECTOR_PATH, filePath);
     }
   } else {
@@ -373,26 +406,8 @@ async function captureScreenshot (page, browser, selector, selectorMap, config, 
       if (el) {
         const box = await el.boundingBox();
         if (box) {
-          // Resize the viewport to screenshot elements outside of the viewport
-          if (config.useBoundingBoxViewportForSelectors !== false) {
-            const bodyHandle = await page.$('body');
-            const boundingBox = await bodyHandle.boundingBox();
-
-            await page.setViewport({
-              width: Math.max(viewport.width, Math.ceil(boundingBox.width)),
-              height: Math.max(viewport.height, Math.ceil(boundingBox.height))
-            });
-          }
-
-          const type = config.puppeteerOffscreenCaptureFix ? page : el;
-          const params = config.puppeteerOffscreenCaptureFix
-            ? {
-                captureBeyondViewport: false,
-                path: path,
-                clip: box
-              }
-            : { captureBeyondViewport: false, path: path };
-
+          var type = config.puppeteerOffscreenCaptureFix ? page : el;
+          var params = config.puppeteerOffscreenCaptureFix ? { path: path, clip: box } : { path: path };
           await type.screenshot(params);
         } else {
           console.log(chalk.yellow(`Element not visible for capturing: ${s}`));
@@ -405,17 +420,18 @@ async function captureScreenshot (page, browser, selector, selectorMap, config, 
     };
 
     const selectorsShot = async () => {
-      for (let i = 0; i < selectors.length; i++) {
-        const selector = selectors[i];
-        filePath = selectorMap[selector].filePath;
-        ensureDirectoryPath(filePath);
-        try {
-          await selectorShot(selector, filePath);
-        } catch (e) {
-          console.log(chalk.red(`Error capturing Element ${selector}`), e);
-          return fs.copy(config.env.backstop + ERROR_SELECTOR_PATH, filePath);
-        }
-      }
+      return Promise.all(
+        selectors.map(async selector => {
+          filePath = selectorMap[selector].filePath;
+          ensureDirectoryPath(filePath);
+          try {
+            await selectorShot(selector, filePath);
+          } catch (e) {
+            console.log(chalk.red(`Error capturing Element ${selector}`), e);
+            return fs.copy(config.env.backstop + ERROR_SELECTOR_PATH, filePath);
+          }
+        })
+      );
     };
     await selectorsShot();
   }
@@ -423,7 +439,7 @@ async function captureScreenshot (page, browser, selector, selectorMap, config, 
 
 // handle relative file name
 function translateUrl (url) {
-  const RE = /^[./]/;
+  const RE = new RegExp('^[./]');
   if (RE.test(url)) {
     const fileUrl = 'file://' + path.join(process.cwd(), url);
     console.log('Relative filename detected -- translating to ' + fileUrl);
